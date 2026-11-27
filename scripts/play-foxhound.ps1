@@ -50,6 +50,8 @@ $settings = @{
     VICTORY_TEXTURE_STAGE_MS = '16'; VICTORY_LEVELS_ON_DEMAND = '0'
     VICTORY_PRELUDE_UPLOADS = '1'; VICTORY_SHOW_NEW_LATER = '1'; VICTORY_POOL_SMALL = '0'; VICTORY_TABLED_REREAD = '1'
     VICTORY_QUEUE_HOST_TEXTURES = '0'
+    # Refresh helpers woken at each submission's start (RTX 4090 + 7950X3D, walking: longest frame 525 -> 145 ms)
+    VICTORY_PASSES_HOT = '1'
     # Descriptor heaps' records
     VICTORY_HEAP_SYNC_FIRST = '1'; VICTORY_SYNC_IN_PLACE = '1'; VICTORY_SPANS_QUICK = '1'; VICTORY_SYNC_FINE = '1'
     VICTORY_HEAP_SYNC_AT_SUBMIT = '1'
