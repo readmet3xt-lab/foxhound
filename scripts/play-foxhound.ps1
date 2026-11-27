@@ -52,6 +52,8 @@ $settings = @{
     VICTORY_QUEUE_HOST_TEXTURES = '0'
     # Refresh helpers woken at each submission's start (RTX 4090 + 7950X3D, walking: longest frame 525 -> 145 ms)
     VICTORY_PASSES_HOT = '1'
+    # A frame's texture pass runs at most 8 ms in all, the rest a frame later (RTX 4090, walking uncapped: 39.4 -> 47.0 fps)
+    VICTORY_TEXSPK_PASS_MS = '8'
     # Descriptor heaps' records
     VICTORY_HEAP_SYNC_FIRST = '1'; VICTORY_SYNC_IN_PLACE = '1'; VICTORY_SPANS_QUICK = '1'; VICTORY_SYNC_FINE = '1'
     VICTORY_HEAP_SYNC_AT_SUBMIT = '1'
