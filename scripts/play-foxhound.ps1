@@ -90,6 +90,19 @@ $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DAT
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 
+function Show-PreparationOutput([int]$Last) {
+    begin { $tail = [System.Collections.Generic.Queue[object]]::new() }
+    process {
+        if ("$_" -match '^\d+ (shaders in the cache,|pipelines known,|of \d+,)') {
+            $_
+        } else {
+            if ($tail.Count -eq $Last) { [void]$tail.Dequeue() }
+            $tail.Enqueue($_)
+        }
+    }
+    end { $tail.ToArray() }
+}
+
 $logs = Join-Path $env:LOCALAPPDATA 'victory\logs'; New-Item -ItemType Directory -Force $logs | Out-Null
 if (-not $NoPrepare) {
     # The tools cannot ask the card as a run does: NVIDIA and Intel cards run waves of 32 lanes, AMD cards the
@@ -105,11 +118,11 @@ if (-not $NoPrepare) {
         $stampFile = Join-Path $env:LOCALAPPDATA "victory\prepared-$Build.txt"
         if ((Get-Content $stampFile -Raw -ErrorAction SilentlyContinue) -ne $stamp) {
             Write-Host 'Translating the title''s shaders (a few minutes, once per build)...'
-            & $victory shaders (Split-Path -Parent $Exe) 2>&1 | Select-Object -Last 3
+            & $victory shaders (Split-Path -Parent $Exe) 2>&1 | Show-PreparationOutput -Last 3
             if ($LASTEXITCODE -eq 0) { [IO.File]::WriteAllText($stampFile, $stamp) }
         }
         Write-Host 'Compiling the pipelines earlier runs asked for (seconds, or minutes after a new build or driver)...'
-        & $victory warm 2>&1 | Select-Object -Last 2
+        & $victory warm 2>&1 | Show-PreparationOutput -Last 2
     } finally { Pop-Location; Remove-Item Env:VICTORY_HOST_WAVE -ErrorAction SilentlyContinue }
 }
 if ($PrepareOnly) { return }
