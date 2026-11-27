@@ -774,18 +774,11 @@ fn lowered_with_wave(
     (lowered.wave_size, shader)
 }
 
-/// Two console waves in a group of 128 threads, each run as two host waves of 32. Lane t goes
-/// round a per-lane loop (t >> 4) + 1 times: it writes its sum to LDS and adds that of lane
-/// t ^ 63 (in the other host wave of its console wave) with no barrier between, as one console
-/// wave may; after the loop every lane adds lane 63's sum (`v_readlane_b32`). The loop's back
-/// edge is taken as the console takes it, by each console wave as a whole, and the two console
-/// waves go round 4 and 8 times: their host waves meet per console wave
-/// ([`lower::with_pair_meetings`]). A group barrier in the loop would wait for the threads of
-/// the console wave that left it (`CS_DefragHeap_ComputeRelocations`, groups of 128, whose
-/// console waves walk a heap each its own way).
-#[test]
-fn console_waves_of_one_group_meet_on_their_own_in_loops_of_their_own() {
-    let words = [
+/// Lane t goes round a per-lane loop (t >> 4) + 1 times: it writes its sum
+/// to LDS and adds that of lane t ^ 63 (in the other host wave of its
+/// console wave) with no barrier between. Then it adds lane 63's sum.
+fn lds_loop(threads: u32, then: &[u32]) -> NativeProgram {
+    let mut words = vec![
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0: this lane's LDS dword
         0x3A06_00BF, // v_xor_b32 v3, 63, v0
         0x3406_0682, // v_lshlrev_b32 v3, 2, v3: the partner lane's (other half, same wave)
@@ -804,16 +797,69 @@ fn console_waves_of_one_group_meet_on_their_own_in_loops_of_their_own() {
         0x7DA8_0B07, // v_cmpx_gt_u32 exec, v7, v5: the lanes with rounds left
         0xBF89_FFF7, // s_cbranch_execnz loop
         0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+    ];
+    words.extend_from_slice(then);
+    words.extend_from_slice(&[
         0xD760_0007,
         0x0001_7F02, // v_readlane_b32 s7, v2, 63
         0x4A04_0407, // v_add_nc_u32 v2, s7, v2
         0xE070_1000,
         0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
-    ];
-    let mut native = native_of(&words, true, 128);
+    ]);
+    let mut native = native_of(&words, true, threads);
     if let StageIo::Cs(cs) = &mut native.io {
         cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
     }
+    native
+}
+
+#[test]
+fn host_loop_retry_keeps_the_blocks_that_need_guest_wave_widening() {
+    // The host-loop retry cannot fix a separate LDS region after the loop.
+    let native = lds_loop(
+        64,
+        &[
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+            0xBF88_0006, // s_cbranch_execz restore
+            0xD834_0000,
+            0x0000_0201, // ds_write_b32 v1, v2
+            0xD8D8_0000,
+            0x0400_0003, // ds_read_b32 v4, v3
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A04_0902, // v_add_nc_u32 v2, v2, v4
+            0xBEFE_040E, // restore: s_mov_b64 exec, s[14:15]
+        ],
+    );
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&bytes).expect("empty container");
+    let loops = lower::loop_branches(&p, &st);
+    assert_eq!(loops.len(), 1);
+
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    lower::take_needs();
+    let first = super::emit_program(&c, &native, &p, &st, &io, &res);
+    let needs = lower::take_needs();
+    let widened = super::widen(&c, &native, &p, false, false, true);
+    lower::TEST_HOST_WAVE.set(was);
+
+    assert_eq!(first.expect("initial attempt").1, Some(64));
+    let branches = lower::branches_around(&st, &needs).expect("widenable branches");
+    assert_eq!(branches.len(), 1);
+    assert!(!loops.contains(&branches[0]), "the LDS branch after the loop");
+    assert_eq!(widened.expect("guest wave-wide retry").1, Some(32));
+}
+
+/// Two console waves in a group of 128 threads, each run as two host waves
+/// of 32. The two waves go round 4 and 8 times and need to meet per console
+/// wave: a group barrier would wait for the threads of the wave that left.
+#[test]
+fn console_waves_of_one_group_meet_on_their_own_in_loops_of_their_own() {
+    let native = lds_loop(128, &[]);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let back = (0..p.blocks.len())
         .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execnz"))
