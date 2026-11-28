@@ -52,6 +52,8 @@ $settings = @{
     VICTORY_QUEUE_HOST_TEXTURES = '0'
     # A frame's texture passes within 8 ms together; helpers woken at each submission's start (PR #13)
     VICTORY_TEXSPK_PASS_MS = '8'; VICTORY_PASSES_HOT = '1'
+    # Write faults without the guards' lock (issue #8): title threads waited 13-17 ms a frame; 2-3 % faster
+    VICTORY_FAULT_UNLOCKED = '1'
     # Descriptor heaps' records
     VICTORY_HEAP_SYNC_FIRST = '1'; VICTORY_SYNC_IN_PLACE = '1'; VICTORY_SPANS_QUICK = '1'; VICTORY_SYNC_FINE = '1'
     VICTORY_HEAP_SYNC_AT_SUBMIT = '1'

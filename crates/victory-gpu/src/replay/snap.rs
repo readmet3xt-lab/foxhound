@@ -26,6 +26,18 @@ const STAGING: u64 = 256 << 20;
 const STAGINGS: usize = 4;
 /// The most of a buffer in one piece.
 const PIECE: u64 = 32 << 20;
+
+/// How long the capture of the card's memory may take before it is given up
+/// (`VICTORY_RECORD_LIMIT_S`, 20 when unset; 0: no limit). The title's
+/// threads stand still while it runs, and the title ends itself when one of
+/// them has not moved for 30 s.
+fn time_limit() -> Option<std::time::Duration> {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let s = *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_RECORD_LIMIT_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(20)
+    });
+    (s > 0).then(|| std::time::Duration::from_secs(s))
+}
 /// What the CPU changes is kept in units of.
 const PAGE: usize = 4096;
 /// What one thread compares at a time.
@@ -594,6 +606,21 @@ impl Capture {
             // Moved in: the writers end when it goes.
             let todo = todo;
             for mut pieces in batches {
+                // The title stands still meanwhile, and its own watchdog ends
+                // it after 30 s (foxhound #18: 1.27 GB in 30 s on an
+                // RTX 5060 Ti): given up first, with a note, and it goes on.
+                if let Some(most) = time_limit()
+                    && self.began.elapsed() > most
+                {
+                    return Err(format!(
+                        "the capture was given up after {:.1} s with {} MB of the card's memory written, before the \
+                         title's own 30-second watchdog would end it (VICTORY_RECORD_LIMIT_S={}; 0: no limit)",
+                        self.began.elapsed().as_secs_f64(),
+                        end.load(Ordering::Relaxed) >> 20,
+                        most.as_secs()
+                    )
+                    .into());
+                }
                 {
                     let held = lock(&r.held);
                     pieces.retain(|p| held.contains_key(&p.res.id));

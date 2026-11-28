@@ -218,6 +218,91 @@ const BETWEEN: u64 = 4 << 20;
 /// The most steps of a submission done this way.
 const MOST: usize = 12288;
 
+/// The most bytes between two places of one host copy read by one copy into
+/// the buffer between (`VICTORY_CARD_STEPS_JOIN`, 4096 when unset; 0: each
+/// place its own copy, as before).
+///
+/// A frame's 2,000-5,000 fills of constant buffers read some hundreds of
+/// bytes each out of the title's ring, one after the other: each was a copy
+/// of its own on the card, and with the copy back out of it 10,000 commands
+/// a frame of the card's ~11,000 (run of 2026-11-28 04:05, the card 92 %
+/// busy in the drive). The gaps are copied too (into our buffer only: no
+/// step reads them), and the refresh of the host copy covers them already
+/// (it runs from the first range read to the last).
+fn join_gap() -> usize {
+    static GAP: OnceLock<usize> = OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::env::var("VICTORY_CARD_STEPS_JOIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4096)
+    })
+}
+
+/// A range of a host copy that steps read, and where it goes in the buffer
+/// between ([`lay_out`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct Place {
+    /// The host copy, by its address.
+    from: usize,
+    src: usize,
+    len: usize,
+    level: u32,
+    /// Read through a descriptor slot: a constant buffer view, whose address
+    /// must lie on 256 bytes.
+    slot: bool,
+    at: u64,
+}
+
+/// One copy into the buffer between: of the host copy that place `first`
+/// reads, `[src, src + len)` to `at`.
+#[derive(Debug)]
+struct Span {
+    first: usize,
+    src: usize,
+    len: usize,
+    level: u32,
+    at: u64,
+}
+
+/// Lays out the places in the buffer between (sets their `at`) and returns
+/// the copies that bring them there: the places of one host copy and level
+/// in address order, one copy for each run whose gaps are at most `gap`
+/// bytes. A place in a run lies as far from the run's start as its address
+/// does, and a run starts at an offset that is its address's modulo 256, so
+/// a place on 256 bytes in title memory is on 256 bytes here too. A place
+/// read by a slot whose address is not on 256 bytes gets a copy of its own
+/// at an offset on 256 bytes, as every place did with no joining (`gap` 0
+/// keeps that for all).
+fn lay_out(places: &mut [Place], gap: usize) -> Vec<Span> {
+    let mut order: Vec<usize> = (0..places.len()).collect();
+    order.sort_by_key(|&i| (places[i].from, places[i].level, places[i].src));
+    let mut spans: Vec<Span> = Vec::new();
+    // Whether the last span takes more places.
+    let mut open = false;
+    let mut end = 0u64;
+    for i in order {
+        let p = places[i];
+        let mirrored = gap > 0 && (!p.slot || p.src % 256 == 0);
+        let joins = open
+            && mirrored
+            && spans.last().is_some_and(|s| {
+                places[s.first].from == p.from && s.level == p.level && p.src <= s.src + s.len + gap
+            });
+        if joins {
+            let s = spans.last_mut().unwrap_or_else(|| unreachable!());
+            s.len = s.len.max(p.src + p.len - s.src);
+            places[i].at = s.at + (p.src - s.src) as u64;
+            end = end.max(s.at + s.len as u64);
+        } else {
+            let base = end.next_multiple_of(256);
+            let at = if mirrored { base + (p.src % 256) as u64 } else { base };
+            places[i].at = at;
+            spans.push(Span { first: i, src: p.src, len: p.len, level: p.level, at });
+            end = at + p.len as u64;
+            open = mirrored;
+        }
+    }
+    spans
+}
+
 /// How a fill's bytes get where its list reads them, if the card brings
 /// them.
 #[derive(Clone)]
@@ -721,6 +806,10 @@ static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 /// copy at its place ahead of them takes its bytes from ([`read_behind_placed`]).
 static DONE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Since the last frame-rate line: copies into the buffer between (the spans
+/// of [`lay_out`]).
+static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
 /// list by address, their place in it).
@@ -815,14 +904,18 @@ impl Host {
             all
         };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
-        // The places read (host copy, address, bytes, level): where in the
-        // buffer between their bytes are.
-        let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
+        // The places read (host copy, address, bytes, level), by their number
+        // in `read_at`: where in the buffer between their bytes are is laid
+        // out once all are known ([`lay_out`]), and `Op::at` holds the number
+        // until then.
+        let mut places: HashMap<(usize, usize, usize, u32), usize> = HashMap::default();
+        let mut read_at: Vec<Place> = Vec::new();
+        // The host copy each of `read_at` reads.
+        let mut read_from: Vec<Arc<Shadow>> = Vec::new();
         // Some 2,800 fills a frame, of a few hundred places: what holds each
         // is looked for once, as long as no copy is added to the writers.
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
         let mut room = HashMap::default();
-        let mut end = 0u64;
         for &(i, level) in &chosen {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
                 continue;
@@ -842,21 +935,19 @@ impl Host {
                 }
             };
             let place = (Arc::as_ptr(&from) as usize, src, len, level);
-            let at = match places.get(&place) {
-                Some(&at) => at,
+            let number = match places.get(&place) {
+                Some(&number) => number,
                 None => {
-                    if end + len as u64 > BETWEEN {
-                        return Err("too much at once");
-                    }
                     if !mapped(src, src + len, &mut room) {
                         return Err("not all of what it reads is mapped");
                     }
-                    let at = end;
-                    end = (end + len as u64).next_multiple_of(256);
-                    places.insert(place, at);
-                    at
+                    read_at.push(Place { from: place.0, src, len, level, slot: false, at: 0 });
+                    read_from.push(from.clone());
+                    places.insert(place, read_at.len() - 1);
+                    read_at.len() - 1
                 }
             };
+            let at = number as u64;
             let to = match does[i] {
                 Does::Copy { .. } => {
                     let to = holder(&writers, dst, dst + len)?;
@@ -891,6 +982,22 @@ impl Host {
                 to,
             });
         }
+        // Where each place's bytes go in the buffer between: places read by a
+        // slot are constant buffer views, whose address must be on 256 bytes.
+        for op in &ops {
+            if matches!(op.to, To::Slot(..)) {
+                read_at[op.at as usize].slot = true;
+            }
+        }
+        let read_spans = lay_out(&mut read_at, join_gap());
+        READS.fetch_add(read_spans.len() as u64, Ordering::Relaxed);
+        let end = read_spans.iter().map(|s| s.at + s.len as u64).max().unwrap_or(0);
+        if end > BETWEEN {
+            return Err("too much at once");
+        }
+        for op in &mut ops {
+            op.at = read_at[op.at as usize].at;
+        }
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
@@ -924,15 +1031,18 @@ impl Host {
         own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
         for level in 0..=levels {
-            let mut reads = Vec::new();
+            // One copy for each span of places of this level.
+            let reads: Vec<(&ID3D12Resource, u64, u64, u64)> = read_spans
+                .iter()
+                .filter(|s| s.level == level)
+                .map(|s| {
+                    let from = &read_from[s.first];
+                    (&from.buffer, from.offset(s.src as u64), s.at, s.len as u64)
+                })
+                .collect();
             let mut writes = Vec::new();
             for op in ops.iter().filter(|op| op.level == level) {
                 let len = op.len as u64;
-                let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
-                // (Each place once.)
-                if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
-                    reads.push(read);
-                }
                 match &op.to {
                     To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
                     To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
@@ -1033,11 +1143,14 @@ pub(super) fn log(frames: f64) {
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
-         copies, {:.1} KB; {:.2} submissions refused and waited; {:.2} fills read where a copy at its place takes its bytes \n         from (VICTORY_PLACED_READS)",
+         copies, {:.1} KB in {:.1} copies into the buffer between (VICTORY_CARD_STEPS_JOIN={}); {:.2} submissions refused \
+         and waited; {:.2} fills read where a copy at its place takes its bytes from (VICTORY_PLACED_READS)",
         stage(),
         d[0],
         d[1],
         d[2] / 1024.0,
+        READS.swap(0, Ordering::Relaxed) as f64 / frames,
+        join_gap(),
         d[3],
         d[4],
     );
@@ -1067,6 +1180,97 @@ pub(super) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn place(from: usize, src: usize, len: usize, level: u32, slot: bool) -> Place {
+        Place { from, src, len, level, slot, at: 0 }
+    }
+
+    /// Every place's bytes lie in a span of its host copy and level, as far
+    /// from the span's start in the buffer as in title memory; spans do not
+    /// meet; slots are on 256 bytes.
+    fn laid_out_right(places: &[Place], spans: &[Span]) {
+        for p in places {
+            assert!(!p.slot || p.at % 256 == 0, "{p:?}");
+            let s = spans
+                .iter()
+                .find(|s| {
+                    places[s.first].from == p.from
+                        && s.level == p.level
+                        && s.src <= p.src
+                        && p.src + p.len <= s.src + s.len
+                        && s.at + (p.src - s.src) as u64 == p.at
+                })
+                .unwrap_or_else(|| panic!("no span holds {p:?}: {spans:?}"));
+            let _ = s;
+        }
+        let mut by_at: Vec<(u64, u64)> = spans.iter().map(|s| (s.at, s.at + s.len as u64)).collect();
+        by_at.sort_unstable();
+        assert!(by_at.windows(2).all(|w| w[0].1 <= w[1].0), "{by_at:?}");
+    }
+
+    /// The fills of one frame's constant buffers, one after the other in the
+    /// title's ring: one copy instead of one each.
+    #[test]
+    fn places_next_to_each_other_are_one_copy() {
+        let mut places: Vec<Place> =
+            (0..40).map(|n| place(7, 0x1000 + n * 0x300, if n % 2 == 0 { 0x290 } else { 0x1e0 }, 0, true)).collect();
+        let spans = lay_out(&mut places, 4096);
+        assert_eq!(spans.len(), 1);
+        laid_out_right(&places, &spans);
+    }
+
+    /// Gaps over the limit, other host copies and other levels are copies of
+    /// their own.
+    #[test]
+    fn far_places_other_copies_and_levels_are_apart() {
+        let mut places = vec![
+            place(7, 0x1000, 0x100, 0, true),
+            place(7, 0x1100, 0x100, 0, true),
+            place(7, 0x1200 + 8192, 0x100, 0, true),
+            place(9, 0x1300, 0x100, 0, true),
+            place(7, 0x1400, 0x100, 1, false),
+        ];
+        let spans = lay_out(&mut places, 4096);
+        assert_eq!(spans.len(), 4);
+        laid_out_right(&places, &spans);
+    }
+
+    /// A slot place not on 256 bytes in title memory gets a copy of its own
+    /// on 256 bytes here; other places off 256 bytes keep their offset.
+    #[test]
+    fn slots_stay_on_256_bytes() {
+        let mut places = vec![
+            place(7, 0x1000, 0x100, 0, true),
+            place(7, 0x1110, 0x40, 0, true),
+            place(7, 0x1150, 0x40, 0, false),
+            place(7, 0x1200, 0x100, 0, true),
+        ];
+        let spans = lay_out(&mut places, 4096);
+        laid_out_right(&places, &spans);
+        assert_eq!(places[1].at % 256, 0);
+        assert_eq!(places[2].at % 256, 0x50);
+        assert!(spans.len() <= 3, "{spans:?}");
+    }
+
+    /// No joining: every place its own copy on 256 bytes, as before.
+    #[test]
+    fn no_gap_is_a_copy_for_each_place() {
+        let mut places: Vec<Place> = (0..5).map(|n| place(7, 0x1010 + n * 0x100, 0x80, 0, n % 2 == 0)).collect();
+        let spans = lay_out(&mut places, 0);
+        assert_eq!(spans.len(), 5);
+        assert!(places.iter().all(|p| p.at % 256 == 0));
+        laid_out_right(&places, &spans);
+    }
+
+    /// Places that overlap or repeat share the bytes.
+    #[test]
+    fn overlapping_places_share_bytes() {
+        let mut places = vec![place(7, 0x2000, 0x200, 0, true), place(7, 0x2100, 0x200, 0, false), place(7, 0x2000, 0x40, 0, true)];
+        let spans = lay_out(&mut places, 4096);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].len, 0x300);
+        laid_out_right(&places, &spans);
+    }
 
     fn copy(dst: usize, src: usize, len: usize, asked: bool) -> Does {
         Does::Copy { dst, src, len, asked }

@@ -38,6 +38,13 @@ memory at 2.3 GB/s, 1 GB the CPU wrote). The recorder holds a copy of the
 memory both sides see that the frame reads, and 1 GB or more of read-back
 buffers, until it is done.
 
+In a real frame of the title the capture can be much slower (foxhound #18:
+1.27 GB written in 30 s on an RTX 5060 Ti with `VICTORY_RELAY=2`), and the
+title ends itself when one of its threads has not moved for 30 s. So the
+capture of the card's memory is given up after `VICTORY_RECORD_LIMIT_S`
+seconds (20 when unset; 0: no limit): `failed.txt` says how far it got, the
+recorder stops, and the title goes on.
+
 ## Running it
 
     victory replay <folder> [--loops 5] [--timing detailed] [experiments]

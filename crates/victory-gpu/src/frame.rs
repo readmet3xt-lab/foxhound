@@ -225,6 +225,9 @@ pub(crate) extern "system" fn wait(
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
         pace::begun();
+        // Frame generation's latency markers: the simulation begins.
+        #[cfg(windows)]
+        crate::streamline::title_frame_begins(crate::queue::presents_so_far());
         if !token.is_null() {
             // SAFETY: checked non-null; the title passes its token.
             unsafe { token.write(frame) };

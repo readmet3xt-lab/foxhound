@@ -275,6 +275,121 @@ fn calls() -> std::sync::MutexGuard<'static, Calls> {
     CALLS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Latency markers set where the title does what they name
+/// (`VICTORY_FRAMEGEN_MARKERS`, on unless `0`), for frame generation's and
+/// Reflex's pacing: the simulation begins when the title's frame does (its
+/// wait for the frame's tick returns), it ends and the render submission
+/// begins at the title's first submission after its last present, and the
+/// submission ends at its present. Off, or where one was not seen, the
+/// marker is set at our present of the frame, as all four were before: the
+/// title's thread had then gone on for most of a frame, and our present
+/// runs on the line's thread after its submissions.
+///
+/// A frame is its present's number ([`crate::queue`]): the title's next
+/// present is the frame its markers are set for.
+fn title_markers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FRAMEGEN_MARKERS").is_none_or(|v| v != "0"))
+}
+
+/// Of [`MARKED`], by the marker they keep.
+const M_SIMULATION_START: usize = 0;
+const M_SIMULATION_END: usize = 1;
+const M_RENDER_SUBMIT_START: usize = 2;
+const M_RENDER_SUBMIT_END: usize = 3;
+
+/// The frames each marker of the title's ([`title_markers`]) was set for, the
+/// last [`RING`] of them by frame: the title runs a frame or two ahead of our
+/// present on the line's thread, which looks its frame up here.
+const RING: usize = 8;
+static MARKED: [[std::sync::atomic::AtomicU32; RING]; 4] =
+    [const { [const { std::sync::atomic::AtomicU32::new(0) }; RING] }; 4];
+
+fn marked(slot: usize, frame: u32) -> bool {
+    MARKED[slot][frame as usize % RING].load(Relaxed) == frame
+}
+
+/// Since the last frame-rate line: markers of the end of the simulation and
+/// of the render submission set at our present for want of the title's, and
+/// all of them.
+static TITLE_MARKERS_MISSED: AtomicU64 = AtomicU64::new(0);
+/// Since the last frame-rate line: upscalings by DLSS whose jitter was not
+/// zero.
+static JITTERED: AtomicU64 = AtomicU64::new(0);
+static TITLE_MARKERS_ALL: AtomicU64 = AtomicU64::new(0);
+
+/// Frames frame generation makes for each rendered one, as asked for when it
+/// was switched on last ([`frames_to_generate`]).
+static FG_FRAMES_ASKED: AtomicU32 = AtomicU32::new(0);
+
+/// Frames shown for each rendered one with frame generation
+/// (`VICTORY_FRAMEGEN_FRAMES`, 2 to 4; 2 when unset): 3 and 4 are DLSS
+/// Multi Frame Generation, which RTX 50 cards offer. Asked for as frames to
+/// generate (one less), and no more than frame generation says it can.
+fn frames_to_generate(most: u32) -> u32 {
+    static SHOWN: OnceLock<u32> = OnceLock::new();
+    let shown = *SHOWN.get_or_init(|| {
+        let shown = std::env::var("VICTORY_FRAMEGEN_FRAMES").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(2);
+        if !(2..=4).contains(&shown) {
+            tracing::warn!(shown, "VICTORY_FRAMEGEN_FRAMES: 2, 3 or 4 frames shown for each rendered one; 2 is taken");
+            return 2;
+        }
+        shown
+    });
+    (shown - 1).min(most.max(1))
+}
+
+/// Sets `marker` for `frame` on the title's thread unless it is set for that
+/// frame already; whether it is set now (or was).
+fn mark_title(slot: usize, marker: u32, frame: u32) -> bool {
+    if !title_markers() || !FG_READY.load(Acquire) || !SWAP_CHAIN_PROXIED.load(Acquire) {
+        return false;
+    }
+    if marked(slot, frame) {
+        return true;
+    }
+    let (Some(sl), Some(set)) = (SL.get(), FUNCTIONS.get().and_then(|f| f.pcl_set_marker)) else {
+        return false;
+    };
+    let Some(token) = frame_token(sl, frame) else {
+        return false;
+    };
+    let began = std::time::Instant::now();
+    // SAFETY: a marker for a token of ours.
+    unsafe { set(marker, token) };
+    spent(T_MARKERS, began);
+    MARKED[slot][frame as usize % RING].store(frame, Relaxed);
+    true
+}
+
+/// The title's frame begins: its simulation does, for its next present
+/// (`presented`: the presents so far).
+pub(crate) fn title_frame_begins(presented: u64) {
+    mark_title(M_SIMULATION_START, abi::SIMULATION_START, presented.wrapping_add(1) as u32);
+}
+
+/// The title submits lists: at the first since its last present its
+/// simulation ends and the frame's render submission begins.
+pub(crate) fn title_submits(presented: u64) {
+    let frame = presented.wrapping_add(1) as u32;
+    if marked(M_RENDER_SUBMIT_START, frame) {
+        return;
+    }
+    // (In order: the simulation's start first, if the frame's begin was not
+    // seen.)
+    mark_title(M_SIMULATION_START, abi::SIMULATION_START, frame);
+    mark_title(M_SIMULATION_END, abi::SIMULATION_END, frame);
+    mark_title(M_RENDER_SUBMIT_START, abi::RENDER_SUBMIT_START, frame);
+}
+
+/// The title presents frame `frame`: its render submission ends.
+pub(crate) fn title_presents(frame: u64) {
+    let frame = frame as u32;
+    if marked(M_RENDER_SUBMIT_START, frame) {
+        mark_title(M_RENDER_SUBMIT_END, abi::RENDER_SUBMIT_END, frame);
+    }
+}
+
 // Counters since the last frame-rate line: upscalings done by DLSS, failed,
 // left to the title; presents with frame generation on and off, frames it
 // reported shown; and in all.
@@ -1065,6 +1180,10 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     if code != 0 {
         return Err(format!("slSetConstants: {} ({code})", abi::result_name(code)));
     }
+    // (DLSS adds detail from frame to frame only out of a jittered scene.)
+    if constants.jitter_offset != [0.0, 0.0] {
+        JITTERED.fetch_add(1, Relaxed);
+    }
     let kinds = [
         (COLOUR, abi::BUFFER_SCALING_INPUT_COLOR, camera.render),
         (DEPTH, abi::BUFFER_DEPTH, camera.render),
@@ -1368,13 +1487,23 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         spent(T_MARKERS, began);
     };
     let mut calls = calls();
-    if calls.simulating != Some(frame) {
+    // Those the title's threads did not set ([`title_markers`]), here.
+    let set = |slot: usize| title_markers() && marked(slot, frame);
+    if calls.simulating != Some(frame) && !set(M_SIMULATION_START) {
         mark(abi::SIMULATION_START);
     }
     calls.simulating = None;
-    mark(abi::SIMULATION_END);
-    mark(abi::RENDER_SUBMIT_START);
-    mark(abi::RENDER_SUBMIT_END);
+    for (slot, marker) in [
+        (M_SIMULATION_END, abi::SIMULATION_END),
+        (M_RENDER_SUBMIT_START, abi::RENDER_SUBMIT_START),
+        (M_RENDER_SUBMIT_END, abi::RENDER_SUBMIT_END),
+    ] {
+        if !set(slot) {
+            mark(marker);
+            TITLE_MARKERS_MISSED.fetch_add(1, Relaxed);
+        }
+    }
+    TITLE_MARKERS_ALL.fetch_add(3, Relaxed);
     let fresh = {
         let latest = SUBMITTED.lock().unwrap_or_else(|e| e.into_inner());
         latest
@@ -1456,6 +1585,25 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     };
     if on != calls.framegen_on {
         let mut options = abi::DlssgOptions::new(if on { abi::DLSSG_ON } else { abi::DLSSG_OFF });
+        if on {
+            // How many it can make (1 without Multi Frame Generation).
+            let mut most = 1;
+            if let Some(get_state) = functions.dlssg_get_state {
+                let mut state = abi::DlssgState::default();
+                // SAFETY: a structure to fill, no options.
+                if unsafe { get_state(&viewport, &mut state, std::ptr::null()) } == 0 {
+                    most = state.num_frames_to_generate_max.max(1);
+                }
+            }
+            options.num_frames_to_generate = frames_to_generate(most);
+            if FG_FRAMES_ASKED.swap(options.num_frames_to_generate, Relaxed) != options.num_frames_to_generate {
+                tracing::info!(
+                    generated = options.num_frames_to_generate,
+                    most,
+                    "DLSS Frame Generation: frames generated for each rendered one (VICTORY_FRAMEGEN_FRAMES)"
+                );
+            }
+        }
         options.flags = abi::DLSSG_RETAIN_RESOURCES_WHEN_OFF;
         options.num_back_buffers = 2;
         options.color_width = planes.size[0];
@@ -1543,7 +1691,11 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
     // SAFETY: a marker for this frame's token.
     unsafe { marker(abi::PRESENT_END, token) };
     let mut calls = calls();
-    if let Some(next) = frame_token(sl, frame.wrapping_add(1)) {
+    // (With the title's markers its frame's begin sets the next one's, unless
+    // it began already: then the present of this one is too late for it.)
+    if !title_markers()
+        && let Some(next) = frame_token(sl, frame.wrapping_add(1))
+    {
         // SAFETY: as above, for the next frame.
         unsafe { marker(abi::SIMULATION_START, next) };
         calls.simulating = Some(frame.wrapping_add(1));
@@ -1845,17 +1997,24 @@ pub(crate) fn line(frames: f64) {
         [&EVALUATED, &FAILED, &FORWARDED, &FG_ON, &FG_OFF, &FG_SHOWN].map(|c| c.swap(0, Relaxed));
     if plan.dlss || forwarded > 0 {
         tracing::info!(
-            "DLSS per frame: {:.2} upscalings by DLSS, {:.2} failed, {:.2} left to the title's FidelityFX ({} by DLSS so far)",
+            "DLSS per frame: {:.2} upscalings by DLSS ({:.2} of them with the scene jittered), {:.2} failed, {:.2} left to the \
+             title's FidelityFX ({} by DLSS so far)",
             done as f64 / frames,
+            JITTERED.swap(0, Relaxed) as f64 / frames,
             failed as f64 / frames,
             forwarded as f64 / frames,
             EVALUATED_ALL.load(Relaxed)
         );
     }
     if plan.framegen {
+        let (missed, all) = (TITLE_MARKERS_MISSED.swap(0, Relaxed), TITLE_MARKERS_ALL.swap(0, Relaxed));
         tracing::info!(
-            "DLSS Frame Generation: {on} presents with it on, {off} off, {shown} frames shown by it (status {:#x}){}",
+            "DLSS Frame Generation: {on} presents with it on, {off} off, {shown} frames shown by it (status {:#x}, {} generated \
+             a frame asked); latency markers set where the title does it: {} of {all} (VICTORY_FRAMEGEN_MARKERS={}){}",
             FG_STATUS.load(Relaxed),
+            FG_FRAMES_ASKED.load(Relaxed),
+            all - missed.min(all),
+            u8::from(title_markers()),
             if FG_READY.load(Relaxed) && SWAP_CHAIN_PROXIED.load(Relaxed) { "" } else { "; not running (see above)" }
         );
         // Where the time of a frame goes in Streamline's calls.

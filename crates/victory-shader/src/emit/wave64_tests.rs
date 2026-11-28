@@ -774,18 +774,11 @@ fn lowered_with_wave(
     (lowered.wave_size, shader)
 }
 
-/// Two console waves in a group of 128 threads, each run as two host waves of 32. Lane t goes
-/// round a per-lane loop (t >> 4) + 1 times: it writes its sum to LDS and adds that of lane
-/// t ^ 63 (in the other host wave of its console wave) with no barrier between, as one console
-/// wave may; after the loop every lane adds lane 63's sum (`v_readlane_b32`). The loop's back
-/// edge is taken as the console takes it, by each console wave as a whole, and the two console
-/// waves go round 4 and 8 times: their host waves meet per console wave
-/// ([`lower::with_pair_meetings`]). A group barrier in the loop would wait for the threads of
-/// the console wave that left it (`CS_DefragHeap_ComputeRelocations`, groups of 128, whose
-/// console waves walk a heap each its own way).
-#[test]
-fn console_waves_of_one_group_meet_on_their_own_in_loops_of_their_own() {
-    let words = [
+/// Lane t goes round a per-lane loop (t >> 4) + 1 times: it writes its sum
+/// to LDS and adds that of lane t ^ 63 (in the other host wave of its
+/// console wave) with no barrier between. Then it adds lane 63's sum.
+fn lds_loop(threads: u32, then: &[u32]) -> NativeProgram {
+    let mut words = vec![
         0x3402_0082, // v_lshlrev_b32 v1, 2, v0: this lane's LDS dword
         0x3A06_00BF, // v_xor_b32 v3, 63, v0
         0x3406_0682, // v_lshlrev_b32 v3, 2, v3: the partner lane's (other half, same wave)
@@ -804,16 +797,69 @@ fn console_waves_of_one_group_meet_on_their_own_in_loops_of_their_own() {
         0x7DA8_0B07, // v_cmpx_gt_u32 exec, v7, v5: the lanes with rounds left
         0xBF89_FFF7, // s_cbranch_execnz loop
         0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+    ];
+    words.extend_from_slice(then);
+    words.extend_from_slice(&[
         0xD760_0007,
         0x0001_7F02, // v_readlane_b32 s7, v2, 63
         0x4A04_0407, // v_add_nc_u32 v2, s7, v2
         0xE070_1000,
         0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
-    ];
-    let mut native = native_of(&words, true, 128);
+    ]);
+    let mut native = native_of(&words, true, threads);
     if let StageIo::Cs(cs) = &mut native.io {
         cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
     }
+    native
+}
+
+#[test]
+fn host_loop_retry_keeps_the_blocks_that_need_guest_wave_widening() {
+    // The host-loop retry cannot fix a separate LDS region after the loop.
+    let native = lds_loop(
+        64,
+        &[
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8E_246A, // s_and_saveexec_b64 s[14:15], vcc
+            0xBF88_0006, // s_cbranch_execz restore
+            0xD834_0000,
+            0x0000_0201, // ds_write_b32 v1, v2
+            0xD8D8_0000,
+            0x0400_0003, // ds_read_b32 v4, v3
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A04_0902, // v_add_nc_u32 v2, v2, v4
+            0xBEFE_040E, // restore: s_mov_b64 exec, s[14:15]
+        ],
+    );
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&bytes).expect("empty container");
+    let loops = lower::loop_branches(&p, &st);
+    assert_eq!(loops.len(), 1);
+
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    lower::take_needs();
+    let first = super::emit_program(&c, &native, &p, &st, &io, &res);
+    let needs = lower::take_needs();
+    let widened = super::widen(&c, &native, &p, false, false, true);
+    lower::TEST_HOST_WAVE.set(was);
+
+    assert_eq!(first.expect("initial attempt").1, Some(64));
+    let branches = lower::branches_around(&st, &needs).expect("widenable branches");
+    assert_eq!(branches.len(), 1);
+    assert!(!loops.contains(&branches[0]), "the LDS branch after the loop");
+    assert_eq!(widened.expect("guest wave-wide retry").1, Some(32));
+}
+
+/// Two console waves in a group of 128 threads, each run as two host waves
+/// of 32. The two waves go round 4 and 8 times and need to meet per console
+/// wave: a group barrier would wait for the threads of the wave that left.
+#[test]
+fn console_waves_of_one_group_meet_on_their_own_in_loops_of_their_own() {
+    let native = lds_loop(128, &[]);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let back = (0..p.blocks.len())
         .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execnz"))
@@ -932,4 +978,77 @@ fn lds_accesses_after_the_last_plain_write_need_no_meeting() {
     assert_eq!(unordered.iter().map(|x| x.0).collect::<Vec<_>>(), ["ds_read_b32", "ds_add_u32"]);
     assert_eq!(unstable.iter().map(|x| x.0).collect::<Vec<_>>(), ["ds_read_b32"]);
     assert!(unordered[0].1 > 0x10, "the read after the barrier");
+}
+
+/// A lane mask kept in two lanes of a VGPR and read back (the water's tiled transmission
+/// keeps its saved EXEC so, with `v_writelane` and `v_readlane`): on a host of 32-lane
+/// waves the high dword lies in lane 1, in the first host wave, and the second host wave's
+/// lanes take their bits from it. Each lane of the mask stores 1.
+#[test]
+fn a_lane_mask_kept_in_vgpr_lanes_comes_back_whole_in_both_halves() {
+    let words = [
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0: the lanes below s0
+        0xBE86_046A, // s_mov_b64 s[6:7], vcc
+        0xD761_000A,
+        0x0001_0006, // v_writelane_b32 v10, s6, 0
+        0xD761_000A,
+        0x0001_0207, // v_writelane_b32 v10, s7, 1
+        0xBE86_0480, // s_mov_b64 s[6:7], 0
+        0xD760_0006,
+        0x0001_010A, // v_readlane_b32 s6, v10, 0
+        0xD760_0007,
+        0x0001_030A, // v_readlane_b32 s7, v10, 1
+        0xBE8C_2406, // s_and_saveexec_b64 s[12:13], s[6:7]
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+    ];
+    let native = native(&words);
+    let p = crate::spill::build(&native).expect("spill::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = crate::Container::parse(&bytes).expect("empty container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("emit");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = match host.compute_pipeline(&shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program: {e}; not run");
+            return;
+        }
+    };
+    for s0 in [0u32, 10, 32, 40, 64] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = s0;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(64)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let want: Vec<u32> = (0..64).map(|t| u32::from(t < s0)).collect();
+        assert_eq!(&out[0][..64], &want[..], "s0 = {s0}");
+    }
+    eprintln!("ran on the hardware device: the kept mask, both halves");
 }

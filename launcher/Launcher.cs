@@ -36,8 +36,8 @@ using Microsoft.Win32;
 [assembly: AssemblyDescription("Settings and start for the foxhound layer")]
 [assembly: AssemblyCompany("readmet3xt-lab")]
 [assembly: AssemblyCopyright("GPL-3.0-or-later")]
-[assembly: AssemblyVersion("0.2.2.0")]
-[assembly: AssemblyFileVersion("0.2.2.0")]
+[assembly: AssemblyVersion("0.2.3.0")]
+[assembly: AssemblyFileVersion("0.2.3.0")]
 
 namespace Foxhound
 {
@@ -239,6 +239,8 @@ namespace Foxhound
         public string Name = "";
         public double Gb;   // 0: not found
         public bool Nvidia { get { return Name.IndexOf("NVIDIA", StringComparison.OrdinalIgnoreCase) >= 0; } }
+        // DLSS Multi Frame Generation (3x, 4x): GeForce RTX 50 cards.
+        public bool Rtx50 { get { return Nvidia && System.Text.RegularExpressions.Regex.IsMatch(Name, @"RTX\s*50\d\d"); } }
         public bool Amd { get { return Name.IndexOf("AMD", StringComparison.OrdinalIgnoreCase) >= 0 || Name.IndexOf("Radeon", StringComparison.OrdinalIgnoreCase) >= 0; } }
 
         public static Card Detect()
@@ -337,15 +339,17 @@ namespace Foxhound
                 new Opt("resolution", "Resolution", false, "1440",
                     new string[] { "1080", "1440", "4k" },
                     new string[] { "1080p class: Series S profile (lightest)", "1440p: Series X profile (tested)", "4K: Series X profile" },
-                    "The console profile the title is told it runs on, and its output size. Series S: the title's own low-resolution scene, no DLSS; for cards under 12 GB. 1440p on the Series X profile is the tested choice. 4K is the profile's stock output (scene 1440p unless DLSS sets it)."),
+                    "The console profile the title is told it runs on, and its output size. Series S: the title's own low-resolution scene (1080p output), the lightest on the card's memory; for cards under 12 GB, with DLSS and Frame Generation as on Series X. 1440p on the Series X profile is the tested choice. 4K is the profile's stock output (scene 1440p unless DLSS sets it)."),
                 new Opt("dlss", "DLSS", false, "quality",
                     new string[] { "off", "dlaa", "quality", "balanced", "performance" },
                     new string[] { "Off (the title's own upscaling)", "DLAA (scene at full size)", "Quality (scene at 67%)", "Balanced (scene at 58%)", "Performance (scene at 50%)" },
-                    "NVIDIA cards, Series X profile only. Needs the folder of NVIDIA's Streamline SDK (set above; NVIDIA's licence does not let it be shipped here). A smaller scene is less work for the card; where the processor is the limit it changes nothing."),
+                    "NVIDIA RTX cards, both profiles (on Series S it takes the place of the title's own upscaling to 1080p). Needs the folder of NVIDIA's Streamline SDK (set above; NVIDIA's licence does not let it be shipped here). A smaller scene is less work for the card; where the processor is the limit it changes nothing."),
                 new Opt("framegen", "Frame Generation", false, "0",
-                    new string[] { "0", "1" },
-                    new string[] { "Off", "On (RTX 40 or later, needs DLSS)" },
-                    "DLSS Frame Generation: every second frame shown is made by the card (smoother, not more responsive). Needs DLSS on and hardware-accelerated GPU scheduling in Windows. Experimental: one report of the title stopping at its first loading with it on (RTX 4090)."),
+                    card.Rtx50 ? new string[] { "0", "1", "3", "4" } : new string[] { "0", "1" },
+                    card.Rtx50
+                        ? new string[] { "Off", "2x (needs DLSS)", "3x (Multi Frame Generation, untested)", "4x (Multi Frame Generation, untested)" }
+                        : new string[] { "Off", "On (RTX 40 or later, needs DLSS)" },
+                    "DLSS Frame Generation: frames between the title's are made by the card (smoother, not more responsive; best from 30 fps up). Needs DLSS on and hardware-accelerated GPU scheduling in Windows. 3x and 4x (RTX 50 only) are DLSS Multi Frame Generation, not tested here. Experimental: reports of the title stopping at its first loading with DLSS on and the 60 fps frame rate (RTX 4090, RTX 5070 Ti); with 30 fps none so far."),
                 new Opt("display", "Display", false, "fullscreen",
                     new string[] { "fullscreen", "borderless", "windowed" },
                     new string[] { "Fullscreen (borderless, fills the monitor)", "Borderless window", "Window with a title bar (shows fps)" },
@@ -356,8 +360,8 @@ namespace Foxhound
                     "The most of the card's memory the layer plans with. Auto: the budget Windows reports. A lower limit leaves memory to other programs and keeps a small card from overflowing into the PC's memory (which is slow). The tested setup uses 11.6 GB at 1440p; under 12 GB choose the Series S profile."),
                 new Opt("textures", "Texture loading", false, "auto",
                     new string[] { "auto", "sharp", "ondemand" },
-                    new string[] { "Auto (by VRAM)", "All detail loaded (sharp)", "Detail on demand (less VRAM, can blur)" },
-                    "All detail loaded: every texture level is put on the card (tested on 12 GB). On demand: levels are loaded as they are needed; less memory, textures can stay blurry for a moment. Auto: on demand under 11 GB."),
+                    new string[] { "Auto (all detail)", "All detail loaded (sharp)", "Detail on demand (less VRAM, blurry or missing textures)" },
+                    "All detail loaded: every texture level is put on the card. On demand: levels are loaded as they are needed; less memory, but on a full card textures stay blurry or missing (Series S test at 6 GB, 2026-11-28). Auto: all detail on every card."),
                 new Opt("ambient", "Dark areas", false, "0.8",
                     new string[] { "0.6", "0.8", "1.0", "1.3", "1.6" },
                     new string[] { "Darker (0.6)", "As tested (0.8)", "Brighter (1.0)", "Bright (1.3)", "Brightest (1.6)" },
@@ -365,7 +369,11 @@ namespace Foxhound
                 new Opt("fps", "Frame rate", false, "title",
                     new string[] { "title", "40", "60" },
                     new string[] { "30 fps (the title's own)", "40 fps", "60 fps" },
-                    "The rate the title is told to run at (its own setting is 30; its frame time, its limiter and its simulation step follow, so the game is not faster, only smoother). The layer needs about 26 ms a frame in gameplay on the tested PC, so 40 is near what it reaches and 60 is not reached yet; frames then come as fast as they are made. Frame Generation doubles what is shown."),
+                    "The rate the title is told to run at (its own setting is 30; its frame time, its limiter and its simulation step follow, so the game is not faster, only smoother). The layer needs about 26 ms a frame in gameplay on the tested PC, so 40 is near what it reaches and 60 is not reached yet; frames then come as fast as they are made. Frame Generation doubles what is shown. Experimental: with 60 fps and DLSS two runs stopped where the world first loads (\"Failed to allocate upload buffer\", issue #9); the log now names what was refused."),
+                new Opt("profile", "Profile", false, "1",
+                    new string[] { "1", "2", "3", "4" },
+                    new string[] { "Profile 1 (the saves so far)", "Profile 2", "Profile 3", "Profile 4" },
+                    "Separate players on one PC: each profile has its own saves and game settings (a data folder of its own under %LOCALAPPDATA%\victory), and its own name in the game (Player, Player 2, ...). Profile 1 is the folder every earlier version used."),
                 new Opt("priority", "Process priority", true, "normal",
                     new string[] { "normal", "above", "high" },
                     new string[] { "Normal", "Above normal", "High" },
@@ -392,6 +400,9 @@ namespace Foxhound
             "VICTORY_SHOW_NEW_LATER=1", "VICTORY_POOL_SMALL=0", "VICTORY_TABLED_REREAD=1", "VICTORY_QUEUE_HOST_TEXTURES=0",
             // A frame's texture passes within 8 ms together; helpers woken at each submission's start (PR #13).
             "VICTORY_TEXSPK_PASS_MS=8", "VICTORY_PASSES_HOT=1",
+            // Write faults open guarded blocks without the guards' lock (issue #8): the title's threads
+            // waited 13-17 ms a frame for it; frame time 2-3 % lower (runs mem5/mem6).
+            "VICTORY_FAULT_UNLOCKED=1",
             "VICTORY_HEAP_SYNC_FIRST=1", "VICTORY_SYNC_IN_PLACE=1", "VICTORY_SPANS_QUICK=1", "VICTORY_SYNC_FINE=1",
             "VICTORY_HEAP_SYNC_AT_SUBMIT=1", "VICTORY_HELPER_PRIORITY=1", "VICTORY_AMBIENT=0.8", "VICTORY_AMBIENT_AIR=1.5",
             "VICTORY_AMBIENT_SPECULAR=1", "VICTORY_EARLY_DEPTH=1", "VICTORY_LEAVE_OUT=02384a60fda6f2d0,731a39171b568298",
@@ -404,6 +415,7 @@ namespace Foxhound
             "VICTORY_DLSS", "VICTORY_DLSS_MODE", "VICTORY_FRAMEGEN", "VICTORY_STREAMLINE_DIR", "VICTORY_VRAM_BUDGET_MB",
             "VICTORY_FRAME_INTERVAL_MS", "VICTORY_RECORD", "VICTORY_LOG", "VICTORY_GAME_DIR", "VICTORY_LEVELS_ON_DEMAND", "VICTORY_RIPE_BLOCKS",
             "VICTORY_AMBIENT", "VICTORY_AMBIENT_AIR", "VICTORY_AMBIENT_SPECULAR", "VICTORY_DISPLAY", "VICTORY_LAUNCHER_KEYS", "VICTORY_CONTROLS_FILE",
+            "VICTORY_PLACED_ORDER", "VICTORY_FRAMEGEN_FRAMES", "VICTORY_DATA_DIR", "VICTORY_GAMERTAG",
         };
 
         public static bool SeriesS(Store s) { return s.Get("resolution", "1440") == "1080"; }
@@ -422,15 +434,7 @@ namespace Foxhound
 
         public static bool DlssUsable(Store s, Card card)
         {
-            return !SeriesS(s) && StreamlineDir(s).Length > 0 && (card.Nvidia || card.Gb == 0);
-        }
-
-        // The card's memory the run plans with, in GB (0: unknown).
-        public static double EffectiveGb(Store s, Card card)
-        {
-            double limit;
-            if (double.TryParse(s.Get("vram", "auto"), out limit)) return card.Gb > 0 ? Math.Min(card.Gb, limit) : limit;
-            return card.Gb;
+            return StreamlineDir(s).Length > 0 && (card.Nvidia || card.Gb == 0);
         }
 
         public static Dictionary<string, string> Environment_(Store s, Card card)
@@ -445,13 +449,20 @@ namespace Foxhound
                 env["VICTORY_DLSS"] = "1";
                 env["VICTORY_DLSS_MODE"] = dlss;
                 env["VICTORY_STREAMLINE_DIR"] = StreamlineDir(s);
-                if (s.Get("framegen", "0") == "1") env["VICTORY_FRAMEGEN"] = "1";
+                string fg = s.Get("framegen", "0");
+                if (fg == "1" || fg == "3" || fg == "4")
+                {
+                    env["VICTORY_FRAMEGEN"] = "1";
+                    // 3x and 4x: Multi Frame Generation, RTX 50 only (the layer asks no more than the card can).
+                    if (fg != "1" && card.Rtx50) env["VICTORY_FRAMEGEN_FRAMES"] = fg;
+                }
             }
             double limit;
             if (double.TryParse(s.Get("vram", "auto"), out limit)) env["VICTORY_VRAM_BUDGET_MB"] = ((int)(limit * 1024)).ToString();
-            double gb = EffectiveGb(s, card);
             string textures = s.Get("textures", "auto");
-            if (textures == "ondemand" || (textures == "auto" && gb > 0 && gb < 11)) env["VICTORY_LEVELS_ON_DEMAND"] = "1";
+            // (auto was "on demand under 11 GB" until 2026-11-28: on a 6 GB card it left the opening's textures and
+            // models missing, ~19,600 waiting; off, as the layer's default, they load)
+            if (textures == "ondemand") env["VICTORY_LEVELS_ON_DEMAND"] = "1";
             env["VICTORY_AMBIENT"] = s.Get("ambient", "0.8");
             env["VICTORY_DISPLAY"] = s.Get("display", "fullscreen");
             env["VICTORY_LAUNCHER_KEYS"] = "1";
@@ -460,6 +471,13 @@ namespace Foxhound
             string fps = s.Get("fps", "title");
             if (fps == "40") env["VICTORY_FRAME_INTERVAL_MS"] = "25";
             else if (fps == "60") env["VICTORY_FRAME_INTERVAL_MS"] = "16.667";
+            // Profiles 2-4: saves and settings in a data folder of their own (issue #11).
+            string profile = s.Get("profile", "1");
+            if (profile == "2" || profile == "3" || profile == "4")
+            {
+                env["VICTORY_DATA_DIR"] = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "victory", "data-profile" + profile);
+                env["VICTORY_GAMERTAG"] = "Player " + profile;
+            }
             if (s.Get("log", "full") == "warn") env["VICTORY_LOG"] = "warn";
             if (Diag(s)) env["VICTORY_RECORD"] = CaptureDir;
             foreach (string raw in s.Get("extra", "").Split('\n'))
@@ -1363,7 +1381,7 @@ namespace Foxhound
                     return;
                 }
                 Stage("Starting the title", known == 0
-                    ? "First run on this PC: every scene compiles its pipelines the first time it is shown. For about a minute each the picture is slow and objects are missing. This is remembered; the next start compiles them here, ahead. F1 while playing: settings."
+                    ? "First run on this PC: every scene compiles its pipelines the first time it is shown. The first scene keeps the loading picture while they are made (up to two minutes); later ones can be slow and miss objects for about a minute. This is remembered; the next start compiles them here, ahead. F1 while playing: settings."
                     : "The window appears in about half a minute. F1 while playing: settings, restart, quit.", -1, 0);
                 Ui(delegate { Start(exe, console, env); });
             }

@@ -459,10 +459,58 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// Whether one of the containers of the title pipeline `this` is one `f`
+/// picks (false for none bound). Known at the call, before any host
+/// pipeline is made.
+#[cfg(windows)]
+pub(crate) fn shaders_any(this: This, f: impl Fn(&Shader) -> bool) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| f(s))
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
+}
+
+/// Whether the frame about to be shown is not, and the picture on the screen
+/// stays as it was (`VICTORY_FIRST_HOLD`, on unless `0`): on a first start
+/// ([`library::cold_start`]) while at least 64 host pipelines are being made,
+/// for at most 120 s of a run from the first frame held.
+///
+/// On a first start nothing is listed to be made early, and the first scene
+/// asks for some 1,200 pipelines at once: its frames dropped 340 to 2,800
+/// draws each for want of them, a black picture at 3-5 fps for half a minute
+/// (foxhound #19, RTX 5060 8 GB). Shown instead is the last whole picture,
+/// the loading screen. Later starts make the scene's pipelines while the
+/// title loads.
+#[cfg(windows)]
+pub(crate) fn hold_present() -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    const MANY: u64 = 64;
+    const MOST: std::time::Duration = std::time::Duration::from_secs(120);
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SINCE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static HELD: AtomicU64 = AtomicU64::new(0);
+    static HOLDING: AtomicBool = AtomicBool::new(false);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_FIRST_HOLD").is_none_or(|v| v != "0")) || !library::cold_start() {
+        return false;
+    }
+    let waiting = make::waiting();
+    let hold = waiting >= MANY && SINCE.get().is_none_or(|since| since.elapsed() < MOST);
+    if hold {
+        let _ = SINCE.get_or_init(std::time::Instant::now);
+        HELD.fetch_add(1, Relaxed);
+        if !HOLDING.swap(true, Relaxed) {
+            tracing::info!(
+                waiting,
+                "first start: the picture stays as it was while the pipelines this place draws with are made (VICTORY_FIRST_HOLD)"
+            );
+        }
+    } else if HOLDING.swap(false, Relaxed) {
+        tracing::info!(held = HELD.load(Relaxed), waiting, "first start: frames are shown again");
+    }
+    hold
 }
 
 /// Draws and dispatches asked of pipelines left out on purpose since the last

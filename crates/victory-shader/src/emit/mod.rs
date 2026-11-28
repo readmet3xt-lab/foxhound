@@ -538,6 +538,9 @@ pub fn emit(
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        if why {
+            eprintln!("WAVE64-SHADER digest={:02x?}", c.digest);
+        }
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
@@ -624,12 +627,9 @@ pub fn emit(
         let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
         // Both archived kernels use one logical wave per group and have
         // validated wave32 PSOs on RTX. Explicit policy wins.
-        // The volumetric light's two tiled programs (`CS_TransmissionVolumetrics_Tiled`
-        // and `_Tiled_LocalLights`, the game, build 1.0.2.1) are of that shape too: groups of 64,
-        // an LDS read and write in one lane-branch region, so no other form translates
-        // them on 32-lane hosts and their dispatches were dropped (no volumetric light
-        // or fog on NVIDIA). Widened, they translate (4 and 7 branches taken wave-wide).
-        // The underwater one (`CS_TransmissionVolumetricsSubmerged`) likewise (29 branches).
+        // The four transmission volumetrics kernels in build 1.0.2.1 also
+        // have LDS reads and writes in a single lane-branch region. Keep
+        // this digest-scoped: independent half-waves can't exchange there.
         // The triangle clip's heap defragmentation (`vfx_triangleClip:CS_DefragHeap_
         // ComputeRelocations`, groups of 128) holds two console waves, which walk the heap
         // each its own way: their host waves meet per console wave ([`widen`]). (Its
@@ -640,9 +640,14 @@ pub fn emit(
                 c.digest,
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+                    // Tiled (5dc3b25986622949), Tiled_LocalLights (6f225b641c5b0708).
                     | [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
                     | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+                    // Submerged (926c46bab3b86bd6), VolumePortalsOnly (a10179ab7eda0dc3),
+                    // as named in the 1.0.2.1 archive. The latter digest is from
+                    // trustno1-coder/VIctory-NVIDIA#101.
                     | [0xf1, 0xf1, 0x61, 0xe4, 0x7e, 0xef, 0xa3, 0x64, 0x69, 0x18, 0x39, 0xfd, 0x72, 0x06, 0xcc, 0xf6]
+                    | [0x4f, 0xa5, 0x83, 0x20, 0xd7, 0x61, 0xbf, 0x55, 0x81, 0x20, 0xf9, 0x2c, 0x19, 0xd3, 0x84, 0xaa]
             )
             || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
                 && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];
@@ -952,7 +957,11 @@ fn emit_program(
     });
     let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
     match again {
-        Ok((shader, Some(w))) if w <= *wave => {
+        // A host-loop retry that still needs wave64 on a wave32 host did
+        // not solve the original lowering failure. Preserve the original
+        // LDS/exchange block IDs so widen() can widen their enclosing guest
+        // branches rather than concluding that there is nothing to widen.
+        Ok((shader, Some(w))) if w <= *wave && w <= lower::host_max_wave() => {
             if why {
                 eprintln!("WAVE-LOOPS {} loop branches taken by each host wave together", loops.len());
             }

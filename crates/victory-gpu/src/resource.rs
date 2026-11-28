@@ -1144,6 +1144,27 @@ struct Heap {
     memory: Memory,
 }
 
+/// Memory for the title's resource or heap could not be had: named in the
+/// log, the first 8 times and every 64th after (the title's ray-tracing
+/// structure builder ended runs with "Failed to allocate upload buffer" and
+/// nothing of ours said why, foxhound #9).
+fn refused(what: &str, hr: HRESULT, size: u64, heap: u32, dimension: u32) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static TIMES: AtomicU64 = AtomicU64::new(0);
+    let n = TIMES.fetch_add(1, Relaxed);
+    if n < 8 || n.is_multiple_of(64) {
+        tracing::warn!(
+            what,
+            hresult = format_args!("{:#x}", hr as u32),
+            size,
+            heap_kind = heap,
+            dimension,
+            times = n + 1,
+            "memory for the title could not be had: refused (heap kinds: 1 default, 2 upload, 3 read-back, 4 custom)"
+        );
+    }
+}
+
 pub(crate) extern "system" fn create_heap(
     _: This,
     desc: *const HeapDesc,
@@ -1169,7 +1190,10 @@ pub(crate) extern "system" fn create_heap(
     };
     let memory = match Memory::new(info) {
         Ok(memory) => memory,
-        Err(hr) => return hr,
+        Err(hr) => {
+            refused("a heap", hr, desc.size, desc.properties.kind, 0);
+            return hr;
+        }
     };
     let heap = Box::new(Heap {
         object: Object::new(&HEAP_FUNCTIONS),
@@ -1862,11 +1886,17 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // Series S: half (run pre5-seriess, 2026-11-28, 6 GB budget: its targets
+    // level off at 1,325 MB, under half of 3,072, so the reserve was never
+    // given up: 1,745 MB kept for targets that never came, the queue at "no
+    // room" for the whole run, 37,000 textures without a host copy and black
+    // objects in the cutscenes; the profile cards under 12 GB use).
     let most = *MOST.get_or_init(|| {
+        let profile: u64 = if crate::console::current() == crate::console::Console::SeriesS { 1536 } else { 3072 };
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or(profile << 20, |mb| mb.min(8192) << 20)
     });
     static SETTLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let settle = *SETTLE.get_or_init(|| {
@@ -2642,6 +2672,55 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, false).map(|made| made.0)
 }
 
+/// Host copies of textures the title fills, made while the card has no room
+/// for them, go into the PC's memory, which the card reads over the bus
+/// (`VICTORY_TEXTURES_IN_PC=0`: they wait for room, as before). Run
+/// pre5-test4 (Series S, a budget of 6 GB): with the card at its line, the
+/// faces and some surfaces of the opening stayed black while 2,700 textures
+/// waited; read from the PC's memory they are slower to sample, not black.
+/// Only while the PC's memory shared with the card is under three quarters
+/// of the system's budget for it ([`pc_room`]).
+#[cfg(windows)]
+pub(crate) fn textures_in_pc() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TEXTURES_IN_PC").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Whether a texture may be made in the PC's memory now ([`textures_in_pc`]):
+/// `memory` as [`crate::host::Host::video_memory`] gives it.
+#[cfg(windows)]
+pub(crate) fn pc_room(memory: Option<[u64; 4]>) -> bool {
+    textures_in_pc() && memory.is_some_and(|[_, _, budget, used]| budget > 0 && used < budget / 4 * 3)
+}
+
+#[cfg(windows)]
+thread_local! {
+    static IN_PC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Textures made in the PC's memory ([`in_pc`]) since the start: count, bytes.
+#[cfg(windows)]
+pub(crate) static IN_PC_MADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// While it lives, the host textures this thread makes for textures the title
+/// fills go into the PC's memory ([`textures_in_pc`]).
+#[cfg(windows)]
+pub(crate) struct InPc(bool);
+
+#[cfg(windows)]
+impl InPc {
+    pub(crate) fn new() -> Self {
+        Self(IN_PC.replace(true))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for InPc {
+    fn drop(&mut self) {
+        IN_PC.set(self.0);
+    }
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
 #[cfg(windows)]
@@ -2711,14 +2790,27 @@ fn host_texture_as(
         }
         value
     });
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
+    // In the PC's memory ([`in_pc`]): a texture the title fills that only
+    // shaders read, with no memory given level by level.
+    let pc = IN_PC.get() && !reserved && fills(desc) && clear_value.is_none() && d.flags & PC_FLAGS == 0;
+    let heap = if pc {
+        D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        }
+    } else {
+        D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        }
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
-    if fills(desc)
+    if !pc
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -2782,8 +2874,22 @@ fn host_texture_as(
         texture = None;
     }
     if let Some(t) = &texture {
+        if pc {
+            use std::sync::atomic::Ordering::Relaxed;
+            // SAFETY: a plain query of the texture's size.
+            let bytes = unsafe { host.device.GetResourceAllocationInfo(0, &[t.GetDesc()]) }.SizeInBytes;
+            let n = IN_PC_MADE[0].fetch_add(1, Relaxed) + 1;
+            IN_PC_MADE[1].fetch_add(bytes, Relaxed);
+            if n == 1 || n.is_multiple_of(1000) {
+                tracing::info!(
+                    so_far = n,
+                    mb = IN_PC_MADE[1].load(Relaxed) >> 20,
+                    "textures made in the PC's memory, the card having no room (VICTORY_TEXTURES_IN_PC=0: they wait)"
+                );
+            }
+        }
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            format!("texture {}x{} f{} flags {:#x}{}", d.width, d.height, d.format, d.flags, if pc { " (PC memory)" } else { "" })
         });
     }
     texture
@@ -3049,7 +3155,10 @@ pub(crate) extern "system" fn create_committed(
     );
     let memory = match Memory::for_resource(info, heap.kind) {
         Ok(memory) => memory,
-        Err(hr) => return hr,
+        Err(hr) => {
+            refused("a committed resource", hr, info.size, heap.kind, desc.dimension);
+            return hr;
+        }
     };
     hand_out_resource(
         desc,
@@ -3560,6 +3669,91 @@ pub(crate) fn test_buffer(width: u64) -> This {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mipped BC texture in the PC's memory that the card reads
+    /// ([`textures_in_pc`]): the runtime takes the heap (custom, no CPU
+    /// access, the PC's pool) for a texture of the card's own layout.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_can_be_made_in_the_pcs_memory() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC7_UNORM, DXGI_SAMPLE_DESC};
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain creation calls with out pointers of ours.
+        if unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }.is_err() {
+            eprintln!("no D3D12 device; not run");
+            return;
+        }
+        let device = device.expect("device");
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 2048,
+            Height: 2048,
+            DepthOrArraySize: 1,
+            MipLevels: 12,
+            Format: DXGI_FORMAT_BC7_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: as above.
+        let made = unsafe {
+            device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut texture)
+        };
+        assert!(made.is_ok(), "{made:?}");
+        let texture = texture.expect("texture");
+        // The steps of a state prelude for its first upload: to the copy
+        // destination and back, with and without the aliasing barrier that
+        // textures cut from a block get.
+        let record = |aliasing: bool| -> windows::core::Result<()> {
+            // SAFETY: a list of our own, recorded and closed, never run.
+            unsafe {
+                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                let list: ID3D12GraphicsCommandList =
+                    device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+                if aliasing {
+                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                                pResourceBefore: std::mem::ManuallyDrop::new(None),
+                                pResourceAfter: std::mem::transmute_copy(&texture),
+                            }),
+                        },
+                    }]);
+                }
+                let transition = |before, after| D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::transmute_copy(&texture),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: before,
+                            StateAfter: after,
+                        }),
+                    },
+                };
+                list.ResourceBarrier(&[transition(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                list.ResourceBarrier(&[transition(D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)]);
+                list.Close()
+            }
+        };
+        assert!(record(false).is_ok(), "{:?}", record(false));
+        // (the runtime refuses an aliasing barrier on a texture of its own
+        // allocation, which is why the prelude gives one only to textures in
+        // the card's memory, cut from blocks: run pre5-test6)
+        assert!(record(true).is_err());
+    }
     use crate::object::slot;
 
     #[test]
@@ -4866,6 +5060,11 @@ float4 lit() : SV_Target { return 1.0; }
         let (last, since) = targets_seen(2400 * MIB, 1_000, 1000 * MIB, 9_000);
         assert_eq!((last, since), (1000 * MIB, 1_000));
         assert_eq!(targets_seen(last, since, 2400 * MIB, 30_000), (2400 * MIB, 30_000));
+
+        // Series S (1,536 MB): its targets settle at 1,325 MB and the room is
+        // given up; with 3,072 it was kept for good.
+        assert_eq!(targets_kept(1536 * MIB, 1325 * MIB, 20_000, 20_000), 0);
+        assert_eq!(targets_kept(most, 1325 * MIB, 600_000, 20_000), 1747 * MIB);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

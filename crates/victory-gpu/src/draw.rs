@@ -341,6 +341,21 @@ pub(crate) const BAKE_PIXEL_SHADERS: [&str; 7] = [
 /// permutations beyond `BAKE_PIXEL_SHADERS`.
 const BAKE_GEOMETRY_SHADERS: [&str; 2] = ["089d6271be6650ef", "d4111a6e6ea49d91"];
 
+/// Whether `shader` is a program of the title's decoration bake, by its hash.
+fn bake_shader(shader: &crate::pipeline::Shader) -> bool {
+    let h = shader.hash.as_str();
+    BAKE_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
+}
+
+/// Whether a draw with the title pipeline `pipeline` bound gets the pass of
+/// its own ahead of a bake ([`State::early_textures`]): written-down lists
+/// (`crate::list::thin`, `VICTORY_THIN_BAKE`) translate such draws at the
+/// title's call. Known at the bind, before any host pipeline is made: by the
+/// shaders' hashes only (the draw's own check also looks at its targets).
+pub(crate) fn bake_pipeline(pipeline: This) -> bool {
+    early_budgets().1 > 0 && crate::pipeline::shaders_any(pipeline, bake_shader)
+}
+
 /// Since the start: early runs of the texture pass, and those of them
 /// made for a bake draw.
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -2575,10 +2590,7 @@ impl State {
     /// (`>= 512x512`) so unseen NPC/head/clothing shader permutations never
     /// bake `neutral()` or `null` stand-ins into permanent ped textures.
     fn is_bake_draw(&self, p: &HostPipeline) -> bool {
-        if p.stages.iter().any(|s| {
-            let h = s.shader.hash.as_str();
-            BAKE_PIXEL_SHADERS.contains(&h) || BAKE_GEOMETRY_SHADERS.contains(&h)
-        }) {
+        if p.stages.iter().any(|s| bake_shader(&s.shader)) {
             return true;
         }
         self.depth == 0
@@ -3083,6 +3095,9 @@ impl State {
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
         let mut room = crate::resource::room(memory);
+        // Without room on the card: made in the PC's memory while it has room
+        // (`resource::textures_in_pc`).
+        let mut pc_room = !room && crate::resource::pc_room(memory);
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -3369,10 +3384,12 @@ impl State {
             // had its colour only in the launches that entered the world
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
+            let mut in_pc = false;
             if !room {
                 let has_its_texture = reupload_when_full()
                     && rest(1, || heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle)));
-                if !has_its_texture {
+                in_pc = !has_its_texture && pc_room;
+                if !has_its_texture && !in_pc {
                     refused += 1;
                     outcome(slot_outcome::HELD);
                     if full_card_pass() {
@@ -3388,8 +3405,8 @@ impl State {
                     }
                     continue;
                 }
-                let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == 1 || n.is_multiple_of(500) {
+                let n = if in_pc { 0 } else { HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1 };
+                if n == 1 || n != 0 && n.is_multiple_of(500) {
                     tracing::info!(
                         so_far = n,
                         slot = index,
@@ -3397,6 +3414,10 @@ impl State {
                     );
                 }
             }
+            // Made in the PC's memory, wherever this slot's host texture is made
+            // from here on (the mirror, or the upload after it): to the end of
+            // the slot's turn.
+            let _in_pc = in_pc.then(crate::resource::InPc::new);
             // Gate new host texture creation / staging on commit reserve after
             // `mapped == 0` reclamation (`texture_slot_gone`) has run, and
             // before mirroring a slot to an unuploaded texture.
@@ -3635,9 +3656,11 @@ impl State {
             rest(6, || crate::texture::unstage(resource));
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
-            if room && since_asked >= 32 << 20 {
+            if since_asked >= 32 << 20 && (room || pc_room) {
                 since_asked = 0;
-                room = rest(6, || crate::resource::room(crate::host::host().and_then(|h| h.video_memory())));
+                let memory = crate::host::host().and_then(|h| h.video_memory());
+                room = rest(6, || crate::resource::room(memory));
+                pc_room = !room && crate::resource::pc_room(memory);
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);

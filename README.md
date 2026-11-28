@@ -95,7 +95,9 @@ the run (a second start, not a first). 30 fps (33.3 ms) is the title's own limit
 
 These are pre.3's. pre.4 was measured in shorter runs only (9 minutes through the launcher, three 7-minute
 diagnostics runs): opening cutscenes 36.0 ms mean (pre.3: 36.3), the first minute of driving 38.7 ms (40.2),
-committed memory about 0.8 GB lower at the same point, no difference in the pictures.
+committed memory about 0.8 GB lower at the same point, no difference in the pictures. pre.5 was tested in
+short runs (6 to 10 minutes): no change in frame time on the Series X profile; on the Series S profile with a 6 GB
+limit, DLSS Quality and Frame Generation, median 27.9 fps with dips to 16 to 22 in the heaviest opening shots.
 
 DLSS mode against cutscene frame time (same run, before the last fix; gameplay is 33.3 ms in all three):
 
@@ -138,6 +140,27 @@ What is known to be wrong:
   (Lossless Scaling) see uneven frame times and look unstable.
 
 Fixed since the first public build:
+
+- **8 GB cards: black faces and black or missing textures** (issues #5, #15, #19): the launcher's "Auto" texture
+  loading took detail levels on demand under 11 GB; on a full card those stayed blurry or missing (a test with a
+  6 GB limit: 19,600 textures waiting, the opening's models missing). Auto now loads every level. And a texture
+  the card has no room for is made in the PC's memory, which the card reads over the bus, instead of staying
+  black until room comes (`VICTORY_TEXTURES_IN_PC=0`: as before). In the same test the faces kept their colour
+  and the frame rate matched the run without it (median 27.9 fps, Series S profile, DLSS Quality and Frame
+  Generation).
+- **DLSS and Frame Generation on the Series S profile** (the setting for cards under 12 GB), and 3x / 4x Multi
+  Frame Generation on RTX 50 cards (untested here). Frame Generation now gets the title's real frame timing
+  (latency markers where the title starts and ends a frame).
+- **Profiles** (issue #11): up to four players on one PC, each with saves and settings of their own (launcher:
+  "Profile").
+- **Cutscene black on a first start** (issue #19): the scene's last whole picture stays while its pipelines are
+  compiled (at most two minutes; `VICTORY_FIRST_HOLD=0` turns it off).
+- **Wrong colours baked into clothes or faces** with `VICTORY_THIN=1` (issue #17; edsuuu and MrEjecutor):
+  bake draws are translated at the title's call (`VICTORY_THIN_BAKE=2`).
+- **Underwater transmission on wave32 cards** (PR #16 by JokerAttack).
+- **Frame recorder** (issue #18): a capture is given up after `VICTORY_RECORD_LIMIT_S` (20 s) and the game goes on.
+- **Guards lock** (issue #8): write faults no longer take it (`VICTORY_FAULT_UNLOCKED=1`).
+- **Refused memory** (issue #9): the log names every resource or heap the title could not get.
 
 - **DLSS greyed out on a PC with integrated graphics** (issue #14): the launcher took the card with the largest
   memory figure in the registry, which an integrated GPU can inflate, and the game made its device on Windows'

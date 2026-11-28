@@ -7106,8 +7106,11 @@ impl HostList {
             let key = std::sync::Arc::as_ptr(copy) as usize;
             // A texture cut from a block may lie where another did: what the
             // card holds of that one is done with before the first upload
-            // into this one.
-            if crate::pool::on() && *first_upload {
+            // into this one. (Not one in the PC's memory,
+            // `resource::textures_in_pc`: an allocation of its own, which the
+            // runtime refuses such a barrier for, and the whole prelude with
+            // it: run pre5-test6, 2026-11-28.)
+            if crate::pool::on() && *first_upload && in_card_heap(&copy.texture) {
                 aliasing.push(D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
                     Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -10103,19 +10106,23 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            // Frame generation: the frame's markers, constants and tags.
-            let presenting = crate::streamline::present_begins(
-                frame,
-                crate::streamline::Planes {
-                    base: (texture, state_u32),
-                    overlay: overlay.filter(|_| composed),
-                    size: [width, height],
-                },
-            );
-            let called = crate::streamline::present_called(&presenting);
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            crate::streamline::present_returned(called);
-            crate::streamline::present_ends(presenting);
+            // A first start's frames that lack the pipelines being made: the
+            // last whole picture stays (`crate::pipeline::hold_present`).
+            if !crate::pipeline::hold_present() {
+                // Frame generation: the frame's markers, constants and tags.
+                let presenting = crate::streamline::present_begins(
+                    frame,
+                    crate::streamline::Planes {
+                        base: (texture, state_u32),
+                        overlay: overlay.filter(|_| composed),
+                        size: [width, height],
+                    },
+                );
+                let called = crate::streamline::present_called(&presenting);
+                let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+                crate::streamline::present_returned(called);
+                crate::streamline::present_ends(presenting);
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -10620,6 +10627,14 @@ fn indirects_around(history: &[D3D12_AUTO_BREADCRUMB_OP], done: usize, all: &ind
         }
     }
     text
+}
+
+/// Whether `texture` lies in a heap of the card's memory (a block's, or one of
+/// its own there), not in the PC's (`crate::resource::textures_in_pc`).
+pub(crate) fn in_card_heap(texture: &ID3D12Resource) -> bool {
+    let mut props = D3D12_HEAP_PROPERTIES::default();
+    // SAFETY: a plain query into a struct of ours.
+    unsafe { texture.GetHeapProperties(Some(&raw mut props), None) }.is_ok_and(|()| props.Type == D3D12_HEAP_TYPE_DEFAULT)
 }
 
 fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {

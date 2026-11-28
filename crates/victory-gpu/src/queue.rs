@@ -597,6 +597,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     let _called = crate::timeline::span("the title's ExecuteCommandLists");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
+    // Frame generation's latency markers: the frame's render submission.
+    #[cfg(windows)]
+    crate::streamline::title_submits(FRAMES.load(Ordering::Relaxed));
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
@@ -908,6 +911,12 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// The title's presents so far ([`FRAMES`]): its next present is frame
+/// generation's next frame (`crate::streamline`).
+pub(crate) fn presents_so_far() -> u64 {
+    FRAMES.load(Ordering::Relaxed)
+}
+
 #[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
@@ -951,6 +960,8 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    crate::streamline::title_presents(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

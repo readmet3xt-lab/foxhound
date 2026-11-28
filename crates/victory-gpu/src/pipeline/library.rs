@@ -793,6 +793,16 @@ pub(crate) fn note_time(key: &str, ms: u64) {
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
+/// Whether no title pipeline was listed to start early when the list was
+/// first read: a first start, or the first after the cache was emptied.
+static COLD: OnceLock<bool> = OnceLock::new();
+
+/// A first start ([`COLD`]): every pipeline a place draws with is made when
+/// a draw first wants it.
+pub(crate) fn cold_start() -> bool {
+    COLD.get().copied().unwrap_or(false)
+}
+
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
@@ -802,6 +812,7 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
             .unwrap_or_default();
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
+        let _ = COLD.set(set.is_empty());
         *used = Some(set);
     }
     used

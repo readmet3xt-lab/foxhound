@@ -56,7 +56,23 @@ pub const USER_NOT_FOUND: HRESULT = 0x8924_5104_u32 as i32;
 
 pub const XUID: u64 = 0x0009_0000_0000_0001;
 pub const LOCAL_ID: u64 = 1;
-const GAMERTAG: &str = "Player";
+/// The user's name (`VICTORY_GAMERTAG`, "Player" when unset): letters,
+/// digits and spaces, at most 15 characters, as a console's gamertag. The
+/// launcher's profiles (each a data folder of its own: saves and settings)
+/// name theirs "Player 2" and on (foxhound #11).
+fn gamertag() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let asked: String = std::env::var("VICTORY_GAMERTAG")
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == ' ')
+            .take(15)
+            .collect();
+        let asked = asked.trim().to_owned();
+        if asked.is_empty() { "Player".to_owned() } else { asked }
+    })
+}
 
 /// The only user; a handle is its address, duplicating and closing are free.
 pub struct User;
@@ -168,7 +184,7 @@ extern "system" fn get_gamertag(
     const MODERN_SUFFIX: u32 = 2;
     let text = match component {
         MODERN_SUFFIX => "",
-        _ => GAMERTAG,
+        _ => gamertag(),
     };
     put_string(text, size, buffer, used)
 }
