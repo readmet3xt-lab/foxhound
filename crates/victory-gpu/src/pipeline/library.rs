@@ -553,12 +553,25 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
 /// A pipeline's name in the library: the hash of what its host
 /// description holds.
 pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> String {
-    let mut h = blake3::Hasher::new();
-    for part in [kind.as_bytes(), root].into_iter().chain(code.iter().copied()).chain([state.as_bytes()]) {
-        h.update(&(part.len() as u64).to_le_bytes());
-        h.update(part);
+    let parts = [kind.as_bytes(), root].into_iter().chain(code.iter().copied()).chain([state.as_bytes()]);
+    // One contiguous input lets BLAKE3 hash multiple short shader chunks in
+    // parallel. Keep the original streaming path for large pipeline descriptions.
+    let size = parts.clone().try_fold(0usize, |n, p| n.checked_add(8)?.checked_add(p.len()));
+    let mut hash = blake3::Hasher::new();
+    if let Some(size) = size.filter(|&n| n <= 8 * blake3::CHUNK_LEN) {
+        let mut frame = Vec::with_capacity(size);
+        for part in parts {
+            frame.extend_from_slice(&(part.len() as u64).to_le_bytes());
+            frame.extend_from_slice(part);
+        }
+        hash.update(&frame);
+    } else {
+        for part in parts {
+            hash.update(&(part.len() as u64).to_le_bytes());
+            hash.update(part);
+        }
     }
-    h.finalize().to_hex()[..32].to_owned()
+    hash.finalize().to_hex()[..32].to_owned()
 }
 
 /// The pipeline named `name`: loaded from the library by `load` if it is
@@ -845,9 +858,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn library_names_preserve_the_length_framing_at_the_buffer_limit() {
+        // One compute stage plus four u64 lengths and the seven-byte kind.
+        const OVERHEAD: usize = 4 * 8 + 7;
+        for size in [8191, 8192, 8193] {
+            let shader = vec![0x5a; size - OVERHEAD];
+            let mut expected = blake3::Hasher::new();
+            for part in [b"compute".as_slice(), &[], shader.as_slice(), &[]] {
+                expected.update(&(part.len() as u64).to_le_bytes());
+                expected.update(part);
+            }
+            assert_eq!(name("compute", &[], &[&shader], ""), expected.finalize().to_hex()[..32]);
+        }
+    }
+
+    #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
         let a = name("graphics", b"root", &[b"vs", b"ps"], "state");
-        assert_eq!(a, name("graphics", b"root", &[b"vs", b"ps"], "state"));
+        // A name from the previous writer must still load from disk.
+        assert_eq!(a, "9402d2bc73e94e1548e2a550a55f878f");
         assert_ne!(a, name("graphics", b"root", &[b"vs", b"ps2"], "state"));
         assert_ne!(a, name("graphics", b"root", &[b"vs", b"ps"], "state2"));
         assert_ne!(a, name("graphics", b"root2", &[b"vs", b"ps"], "state"));

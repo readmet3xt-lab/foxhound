@@ -603,14 +603,14 @@ impl HostPipeline {
         // Not from the library if it has static samplers (their places in the
         // driver's table differ between runs: `library::with_static_samplers`).
         let _samplers = super::library::with_static_samplers(!samplers.is_empty());
-        let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
-                D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: t.host.dxil.as_ptr().cast(),
-                    BytecodeLength: t.host.dxil.len(),
-                },
-            )
+        let dxil = |i: usize| {
+            stages.get(i).and_then(|(s, _)| s.translated()).map(|t| t.host.dxil.as_slice())
+        };
+        let code = |i| {
+            dxil(i).map_or(D3D12_SHADER_BYTECODE::default(), |bytes| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: bytes.as_ptr().cast(),
+                BytecodeLength: bytes.len(),
+            })
         };
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -619,7 +619,7 @@ impl HostPipeline {
                 CS: code(0),
                 ..Default::default()
             };
-            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let name = super::library::name("compute", &root_blob, &[dxil(0).unwrap_or_default()], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -677,7 +677,7 @@ impl HostPipeline {
             let name = super::library::name(
                 "mesh triangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[dxil(0).unwrap_or_default(), dxil(1).unwrap_or_default()],
                 &state,
             );
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
@@ -755,13 +755,13 @@ impl HostPipeline {
             Some(gs) => super::library::name(
                 "graphics rectangles",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
+                &[dxil(0).unwrap_or_default(), dxil(1).unwrap_or_default(), gs],
                 &state,
             ),
             None => super::library::name(
                 "graphics",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[dxil(0).unwrap_or_default(), dxil(1).unwrap_or_default()],
                 &state,
             ),
         };
@@ -1010,15 +1010,6 @@ fn mesh_pipeline(
     } else {
         build(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth))
     }
-}
-
-/// The bytes of shader code (none for an absent stage).
-fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
-    if code.pShaderBytecode.is_null() {
-        return Vec::new();
-    }
-    // SAFETY: a translation's own bytes, alive while its shader is.
-    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
 fn root_signature(
