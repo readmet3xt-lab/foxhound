@@ -80,6 +80,11 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_BOUNDS",
             "VICTORY_LDS_LOOP_ATOMICS",
             "VICTORY_LDS_BOUNDS",
+            // The water's two switches pick the form too: a cache made with
+            // them otherwise served its translations to a run without, and
+            // the other way.
+            "VICTORY_LOOPS_WAVE",
+            "VICTORY_LDS_FIRST_INIT",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
